@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv*/
+cache/
+property_data/
+ckpts/
+checkpoints/
+*.log
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors

@@ -1,0 +1,9 @@
+*.bin
+*.pth
+*.pt
+
+*.csv
+property_data/
+cache/
+__pycache__/
+*.pyc
