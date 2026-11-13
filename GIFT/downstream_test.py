@@ -14,6 +14,7 @@ import argparse
 
 import commentjson
 from basic_pipeline import load_graph_args,eval_result
+from mask_schedule import get_linear_mask_ratio
 from model import get_model
 from dataloaders import add_prompt_transform_dict,\
     graph_text_collator_dict, \
@@ -104,7 +105,11 @@ parser.add_argument('--export_few_shot_dir', type=str, default=None,
 # 在 parser.add_argument 列表里添加：
 parser.add_argument("--use_projector", type=lambda x: (str(x).lower() == 'true'), default=True, help="Whether to use MLP projector")
 parser.add_argument("--use_ot_alignment", type=lambda x: (str(x).lower() == 'true'), default=False, help="Whether to use Optimal Transport (Sinkhorn) based cross-modal alignment")
-parser.add_argument("--use_progressive_mask", type=lambda x: (str(x).lower() == 'true'), default=True, help="Whether to use progressive decoupling mask")
+parser.add_argument("--use_progressive_mask", type=lambda x: (str(x).lower() == 'true'), default=True, help="Enable layerwise relaxation and the training-epoch mask schedule")
+parser.add_argument("--mask_start_ratio", type=float, default=1.0,
+                    help="Training masking probability at epoch 1 (evaluation keeps fixed layerwise masking)")
+parser.add_argument("--mask_end_ratio", type=float, default=0.0,
+                    help="Training masking probability at the final epoch; equal endpoints give a constant mask")
 parser.add_argument("--use_graph_expert", type=lambda x: (str(x).lower() == 'true'), default=True, help="Whether to use independent QKV and FFN for graph")
 parser.add_argument("--graph_expert_lr_scale", type=float, default=0.01,
                     help="LR scale for graph-only QKV/FFN parameters in innovation tuning")
@@ -117,6 +122,10 @@ parser.add_argument('--projector_act', type=str, default='relu', choices=['gelu'
                     help='Activation function for the projector (gelu or relu)')
 
 args,left = parser.parse_known_args()
+try:
+    get_linear_mask_ratio(1, args.epochs, args.mask_start_ratio, args.mask_end_ratio)
+except ValueError as error:
+    parser.error(str(error))
 if args.comparison_protocol_dir:
     if (args.use_huggingface_pipeline or args.split != 'scaffold' or args.few_shot is None
             or args.prompt_policy != 'traversal' or args.task_policy != 'traversal'
@@ -213,16 +222,6 @@ def train(model, loader, optimizer):
     return total_loss / len(loader)*args.grad_accum_step
 
 fig_number=0
-
-def get_linear_mask_ratio(epoch, total_epochs=60, start_ratio=1.0, end_ratio=1.0):
-    """
-    计算线性递减的掩码率。
-    随着 epoch 增加，掩码率从 start_ratio 匀速下降到 end_ratio。
-    """
-    decay_step = (start_ratio - end_ratio) / (total_epochs - 1)
-    current_ratio = start_ratio - (decay_step * epoch)
-    return max(end_ratio, current_ratio)
-
 
 def downstream_task_by_transform(model,train_loader,val_loader,test_loader,prompt=''):
     #reload the model parameter
@@ -330,9 +329,10 @@ def downstream_task_by_transform(model,train_loader,val_loader,test_loader,promp
     else:
         for epoch in range(1, args.epochs + 1):
             if args.use_progressive_mask:
-                current_mask_ratio = get_linear_mask_ratio(epoch, args.epochs)
+                current_mask_ratio = get_linear_mask_ratio(
+                    epoch, args.epochs, args.mask_start_ratio, args.mask_end_ratio)
                 model.encoder.graph_encoder.args.dynamic_mask_ratio = current_mask_ratio
-                print(f"Epoch [{epoch:02d}/{args.epochs-1}] | 当前动态掩码率: {current_mask_ratio:.4f}")
+                print(f"Epoch [{epoch:02d}/{args.epochs}] | 训练动态掩码率: {current_mask_ratio:.4f}")
 
             loss_acc = train(model, train_loader, optimizer)
             print('Epoch: {}\nLoss: {}'.format(epoch, loss_acc))
@@ -393,6 +393,10 @@ def downstream_task_by_transform(model,train_loader,val_loader,test_loader,promp
             df = pd.DataFrame(record,
                               columns=['dataset','split', 'model_name_or_path','epoch','lr','runseed','best_val_idx','train_best','valid_best','test_best','prompt'
                                        ])
+            df['mask_schedule'] = 'linear_epoch' if args.use_progressive_mask else 'fixed'
+            df['mask_start_ratio'] = args.mask_start_ratio if args.use_progressive_mask else 1.0
+            df['mask_end_ratio'] = args.mask_end_ratio if args.use_progressive_mask else 1.0
+            df['mask_eval_ratio'] = 1.0
 
             if args.comparison_protocol_dir:
                 for key, value in comparison_protocol.result_metadata(comparison_manifest, best_val_idx, prompt).items():

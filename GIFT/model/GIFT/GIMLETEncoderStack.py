@@ -198,7 +198,7 @@ class GIMLETEncoderStack(T5Stack):
 
         self.use_ot_alignment = getattr(graph_args, 'use_ot_alignment', False)
 
-        # Disable progressive decoupling, reduce mask impact
+        # Layerwise relaxation, with an optional epoch-dependent training ratio.
         self.use_progressive_mask = getattr(graph_args, "use_progressive_mask", False)
 
         # Keep the original T5 blocks during from_pretrained() so official
@@ -279,7 +279,8 @@ class GIMLETEncoderStack(T5Stack):
         output_hidden_states=None,
         return_dict=None,
     ):
-        self.mask_ratio = getattr(self.graph_encoder.args, "dynamic_mask_ratio", 1.0)
+        self.mask_ratio = (getattr(self.graph_encoder.args, "dynamic_mask_ratio", 1.0)
+                           if self.use_progressive_mask else 1.0)
         graph=graph.to(input_ids.device)
         attention_mask_graph=graph['attn_bias'][:,0,:]
 
@@ -404,10 +405,12 @@ class GIMLETEncoderStack(T5Stack):
                 position_bias_masked[:, :, 0:attention_bias_graph_unimodel.shape[2], attention_bias_graph_unimodel.shape[3]:] = \
                     torch.where(rand_mask, torch.tensor(mask_value, device=target_region.device, dtype=target_region.dtype), target_region)
             elif self.mask_ratio >= 1.0 or not self.training:
-                # If ratio>=1.0 or in test mode, 100% execute strict cross-modal mask
+                # Evaluation keeps the original deterministic layerwise policy;
+                # the epoch schedule changes training only.
                 position_bias_masked[:, :, 0:attention_bias_graph_unimodel.shape[2], attention_bias_graph_unimodel.shape[3]:] = mask_value
 
-        # Assuming 12 layers in total, e.g. keep first 8 layers masked, and unmask last 4 layers
+        # Apply the scheduled mask to the first floor(0.8 * layers) layers;
+        # the remaining layers allow graph queries to attend to valid text keys.
         total_layers = len(self.block)
         relax_layer_idx = int(total_layers * 0.8) if self.use_progressive_mask else int(total_layers)
 

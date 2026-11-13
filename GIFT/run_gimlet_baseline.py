@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 from comparison_protocol import load_task
+from mask_schedule import get_linear_mask_ratio
 
 DATASETS = ["bace", "hiv", "bbbp", "tox21", "esol", "freesolv"]
 VARIANTS = {"gift": "innovation", "gimlet_original": "linear", "gimlet_adapter": "adapter"}
@@ -61,8 +62,11 @@ def prepare(args):
         if args.variant == "gimlet_adapter":
             command += ["--adapter_dim", str(args.adapter_dim)]
         elif args.variant == "gift":
+            get_linear_mask_ratio(1, s["epochs"], args.mask_start_ratio, args.mask_end_ratio)
             command += ["--use_projector", "True", "--use_ot_alignment", "True",
                         "--use_progressive_mask", "True", "--use_graph_expert", "True",
+                        "--mask_start_ratio", str(args.mask_start_ratio),
+                        "--mask_end_ratio", str(args.mask_end_ratio),
                         "--projector_dropout", "0.5", "--projector_blocks", "2", "--projector_act", "relu"]
         if args.data_root:
             command += ["--data_root", str(args.data_root.resolve())]
@@ -88,6 +92,10 @@ def main():
     parser.add_argument("--data_root", type=Path, default=os.environ.get("DATA_ROOT"))
     parser.add_argument("--output_dir", type=Path, default=os.environ.get("OUTPUT_DIR"))
     parser.add_argument("--adapter_dim", type=int, default=int(os.environ.get("ADAPTER_DIM", "64")))
+    parser.add_argument("--mask_start_ratio", type=float, default=float(os.environ.get("MASK_START_RATIO", "1.0")),
+                        help="GIFT only: masking probability at the first training epoch")
+    parser.add_argument("--mask_end_ratio", type=float, default=float(os.environ.get("MASK_END_RATIO", "0.0")),
+                        help="GIFT only: masking probability at the last training epoch")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
     try:

@@ -20,7 +20,7 @@ def fixture_args(tmp_path):
     return SimpleNamespace(comparison_protocol_dir=str(tmp_path), dataset="bace", few_shot=128,
                            runseed=6, seed=42, split="scaffold", batch_size_ori=128,
                            batch_size=16, grad_accum_step=8, epochs=60, test_interval=20,
-                           lr=.01, decay=0., num_workers=0)
+                           lr=.01, decay=0., num_workers=0, mask_start_ratio=1.0, mask_end_ratio=0.0)
 
 
 def make_manifest(tmp_path):
@@ -120,6 +120,20 @@ def test_launch_plan_uses_manifest_and_correct_model(tmp_path, repo, variant, fa
     assert "--not_retest_tasks_in_result_file" not in cmd
     assert variant in str(output)
     assert plans[0]["manifests"][0]["protocol_sha256"]
+    if variant == "gift":
+        assert cmd[cmd.index("--mask_start_ratio") + 1] == "1.0"
+        assert cmd[cmd.index("--mask_end_ratio") + 1] == "0.0"
+        args.mask_start_ratio, args.mask_end_ratio = .8, .2
+        _, custom_plans = prepare(args)
+        custom = custom_plans[0]["command"]
+        assert custom[custom.index("--mask_start_ratio") + 1] == "0.8"
+        assert custom[custom.index("--mask_end_ratio") + 1] == "0.2"
+        args.mask_end_ratio = 1.1
+        with pytest.raises(ValueError, match="mask_end_ratio"):
+            prepare(args)
+    else:
+        assert "--mask_start_ratio" not in cmd
+        assert "--mask_end_ratio" not in cmd
 
 
 def test_launcher_runs_from_repo_and_refuses_existing_results(tmp_path):
