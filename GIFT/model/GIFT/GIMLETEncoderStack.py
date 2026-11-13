@@ -14,7 +14,8 @@ from model.graphormer.modules.graphormer_graph_encoder import GraphEncoder
 logger = logging.get_logger(__name__)
 
 
-def compute_optimal_transport_plan(hidden_states, hidden_states_graph_mapped, epsilon=0.1, n_iters=100):
+def compute_optimal_transport_plan(hidden_states, hidden_states_graph_mapped, epsilon=0.1, n_iters=100,
+                                   text_mask=None, graph_mask=None):
     """
     Compute optimal transport plan T.
     
@@ -23,19 +24,42 @@ def compute_optimal_transport_plan(hidden_states, hidden_states_graph_mapped, ep
         hidden_states_graph_mapped: Graph features H_m, shape [Batch, Graph_Len, Dim]
         epsilon: Entropy regularization coefficient (controls smoothness, smaller is harder to converge)
         n_iters: Sinkhorn iteration times
+        text_mask: [Batch, Text_Len], True/1 for valid text positions.
+        graph_mask: [Batch, Graph_Len], True/1 for valid graph positions,
+            including the virtual graph token. None means all positions are valid.
         
     Returns:
-        T: Optimal transport assignment plan matrix, shape [Batch, Text_Len, Graph_Len]
+        T: Optimal transport assignment plan matrix, shape [Batch, Text_Len, Graph_Len].
+            Padding has zero mass; each valid side has total mass one.
+        C: Cosine transport costs.
     """
     B, N_t, Dim = hidden_states.shape
     _, N_m, _ = hidden_states_graph_mapped.shape
+    if epsilon <= 0 or n_iters < 1:
+        raise ValueError("OT requires epsilon > 0 and n_iters >= 1")
+
+    def valid_positions(mask, shape, name):
+        if mask is None:
+            mask = torch.ones(shape, dtype=torch.bool, device=hidden_states.device)
+        else:
+            if tuple(mask.shape) != shape:
+                raise ValueError("{} must have shape {}".format(name, shape))
+            mask = mask.to(device=hidden_states.device, dtype=torch.bool)
+        if not mask.any(dim=1).all():
+            raise ValueError("{} requires at least one valid position per sample".format(name))
+        return mask
+
+    text_mask = valid_positions(text_mask, (B, N_t), "text_mask")
+    graph_mask = valid_positions(graph_mask, (B, N_m), "graph_mask")
+    # Keep the exponential kernel and normalization stable in mixed precision.
+    work_dtype = torch.float32 if hidden_states.dtype in (torch.float16, torch.bfloat16) else hidden_states.dtype
 
     # ==========================================
     # Step 1: Compute local transport cost matrix C
     # ==========================================
     # L2 normalize features on the last dimension
-    Ht_norm = F.normalize(hidden_states, p=2, dim=-1)           # [B, N_t, Dim]
-    Hm_norm = F.normalize(hidden_states_graph_mapped, p=2, dim=-1) # [B, N_m, Dim]
+    Ht_norm = F.normalize(hidden_states.to(work_dtype).masked_fill(~text_mask.unsqueeze(-1), 0), p=2, dim=-1)
+    Hm_norm = F.normalize(hidden_states_graph_mapped.to(work_dtype).masked_fill(~graph_mask.unsqueeze(-1), 0), p=2, dim=-1)
 
     # Compute cosine similarity via matrix multiplication: cos(h^t_i, h^m_j)
     # Result shape: [B, N_t, N_m]
@@ -44,32 +68,36 @@ def compute_optimal_transport_plan(hidden_states, hidden_states_graph_mapped, ep
     # Compute cost matrix: C_{ij} = 1 - cos(h^t_i, h^m_j)
     C = 1.0 - cos_sim
 
-    mu = torch.empty(B, N_t, dtype=C.dtype, device=C.device).fill_(1.0 / N_t) # Text side distribution
-    nu = torch.empty(B, N_m, dtype=C.dtype, device=C.device).fill_(1.0 / N_m) # Graph side distribution
+    # Uniform marginals over VALID positions only, independently per sample.
+    mu = text_mask.to(C.dtype) / text_mask.sum(dim=1, keepdim=True)
+    nu = graph_mask.to(C.dtype) / graph_mask.sum(dim=1, keepdim=True)
 
     # ==========================================
     # Step 2: Use Sinkhorn algorithm to solve for T
     # ==========================================
     # Compute Kernel matrix: exp(-C / epsilon)
     K = torch.exp(-C / epsilon)
+    valid_pairs = text_mask.unsqueeze(2) & graph_mask.unsqueeze(1)
+    K = K.masked_fill(~valid_pairs, 0)
 
     # Initialize dual variables u and v
-    u = torch.empty(B, N_t, dtype=C.dtype, device=C.device).fill_(1.0 / N_t)
-    v = torch.empty(B, N_m, dtype=C.dtype, device=C.device).fill_(1.0 / N_m)
+    u = mu
+    v = nu
+    min_denominator = torch.finfo(K.dtype).tiny
 
     # Sinkhorn iterations to find optimal solution
     with torch.no_grad():
         for _ in range(n_iters):
             # Update u
-            u = mu / torch.bmm(K, v.unsqueeze(2)).squeeze(2)
+            u = mu / torch.bmm(K, v.unsqueeze(2)).squeeze(2).clamp_min(min_denominator)
             # Update v
-            v = nu / torch.bmm(K.transpose(1, 2), u.unsqueeze(2)).squeeze(2)
+            v = nu / torch.bmm(K.transpose(1, 2), u.unsqueeze(2)).squeeze(2).clamp_min(min_denominator)
 
     # Compute final optimal transport assignment matrix T
     # T_{ij} = u_i * K_{ij} * v_j
     T = u.unsqueeze(2) * K * v.unsqueeze(1)
 
-    return T, C
+    return T.to(hidden_states.dtype), C
 
 
 class ResMLPBlock(nn.Module):
@@ -422,7 +450,11 @@ class GIMLETEncoderStack(T5Stack):
                 #graph_weights = self.graph_weight_proj(hidden_states_graph_mapped).squeeze(-1)
                 #nu = torch.softmax(graph_weights, dim=-1)
 
-                T, C = compute_optimal_transport_plan(hidden_states, hidden_states_graph_mapped)
+                T, C = compute_optimal_transport_plan(
+                    hidden_states, hidden_states_graph_mapped,
+                    text_mask=attention_mask,
+                    graph_mask=~padding_mask_graph.bool(),
+                )
                 multi_token_reps = torch.bmm(T.transpose(1, 2), hidden_states)
                 enhanced_graph_states = hidden_states_graph_mapped + multi_token_reps
 
