@@ -209,3 +209,69 @@ checkpoint loading, and gradient checkpointing. Runner tests check shared
 protocols, incomplete Tox21 handling, metadata rejection, and child scheduling.
 `verify_strategy_gpu.py --output PATH` additionally exercises four real cached
 GIMLET checkpoints on a batch of 16 actual BACE training molecules with CUDA.
+
+### MUV, CYP450, and ToxCast extension
+
+The extension adds all four pre-block strategies and the original shared/post
+configuration (`--include_legacy_post`). It uses the same checkpoint, seed 6,
+seed 42, scaffold 80/10/10, 60 epochs, Adam .01, FP32, micro batch 16 and
+accumulation 8. The default launcher still selects only the original six datasets.
+
+`prepare_extended_benchmarks.py` creates a NEW `independent_labeled_v1` protocol.
+The legacy sampler cumulatively shrinks the training pool between tasks; an audit
+found missing training classes in 15 MUV and 28 prompt-covered ToxCast tasks.
+For the extension, each task samples up to 128 labeled molecules PER CLASS from
+the full scaffold training pool, with NumPy seed `6 + task_id`. Missing labels
+are excluded; validation/test keep all labeled molecules in their original
+scaffold partition. This is explicitly a different sampling protocol from the
+completed six-dataset study, whose results and manifests remain unchanged.
+
+Task eligibility is frozen before training: a prompt and both classes in each
+train/validation/test pool are required. The current data yield CYP450 5/5,
+MUV 14/17 and ToxCast 573/617 eligible tasks. MUV excludes tasks 0 and 12 for
+no test positives, and 16 for no validation positives. ToxCast excludes 31
+missing prompts, 7 single-class validation tasks and 6 single-class test tasks.
+`audit.json` records each included/excluded task, label column, class counts,
+data/prompt hashes, and sampling seeds. These are reported as explicit subsets,
+not full-task benchmark scores. A true zero AUC is allowed for this audited
+protocol; absent-class tasks have already been excluded.
+
+CYP450 comes from the ChemBench source specified in the original GIMLET README.
+Its columns are CYP1A2, CYP2C19, CYP2C9, CYP2D6, CYP3A4. The original prompt file
+swaps CYP2C19/CYP2C9; preparation corrects this ONLY in the new frozen prompt file.
+MUV and ToxCast use the DeepChem downloads already specified by the data loader.
+
+```bash
+HF_HUB_OFFLINE=1 /root/anaconda3/envs/env_gift/bin/python \
+  GIMLET-adapter/prepare_extended_benchmarks.py \
+  --output_dir cache/adapter_protocols/extended_20261115
+
+bash GIMLET-adapter/launch_strategies_4090.sh \
+  --output_root cache/adapter_strategies/extended_20261115 \
+  --datasets cyp450 muv toxcast --include_legacy_post \
+  --protocol_dir /root/model-comparison/cache/adapter_protocols/extended_20261115 \
+  --prompt_file /root/model-comparison/cache/adapter_protocols/extended_20261115/selected_prompt_downstream_task.json \
+  --parallel 4 --memory_budget_gib 40
+```
+
+Use fresh paths for a new preparation or experiment. The extension is 15 dataset
+jobs, 2,960 individual task runs, and can take much longer than the first six
+datasets. The sequential order is CYP450, MUV, ToxCast, with four workers.
+Dataset-level `--resume` preserves completed jobs but restarts an incomplete
+dataset traversal; keep the background queue running for the long ToxCast jobs.
+
+The extension also opts into sample-weighted gradient accumulation with an
+optimizer update for the final incomplete window. Otherwise 97 eligible ToxCast
+tasks with fewer than 128 training molecules would perform NO optimizer updates
+in the legacy loop. Full windows still contain 128 molecules; the last window
+uses its actual sample count and does not carry gradients across epochs. This
+change applies only to `independent_labeled`, consistently across all five groups.
+
+`update_benchmark_report.py --base_root OLD_RUN --extension_root NEW_RUN --watch`
+merges the extension into the existing `OLD_RUN/RESULTS.md` and
+`OLD_RUN/comparison_with_legacy.csv`. Run it with nohup/setsid as well. It shows
+task completion counts while running, and publishes equal-task means only after
+all eligible tasks pass supervisor validation. The old experiment's status and
+raw results stay unchanged. `verify_extended_runtime.py` checks real CUDA
+training and classification scoring for all five configurations plus the longest
+eligible MUV/ToxCast prompts, using 16 large training molecules from each task.

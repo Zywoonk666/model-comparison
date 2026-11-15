@@ -21,7 +21,8 @@ VARIANTS = {"gift": "innovation", "gimlet_original": "linear", "gimlet_adapter":
 def prepare(args):
     repo = args.repo.resolve()
     protocol_dir = args.protocol_dir.resolve()
-    prompts = json.loads((repo / "prompts/selected_prompt_downstream_task.json").read_text())
+    prompt_path = Path(getattr(args, "prompt_file", None) or repo / "prompts/selected_prompt_downstream_task.json").resolve()
+    prompts = json.loads(prompt_path.read_text())
     output = (args.output_dir or repo / "cache/baselines" / args.variant /
               "shot{}_seed{}".format(args.few_shot, args.runseed)).resolve()
     plans = []
@@ -55,10 +56,12 @@ def prepare(args):
                    "--lr", str(s["lr"]), "--decay", str(s["weight_decay"]),
                    "--epochs", str(s["epochs"]), "--test_interval", str(s["test_interval"]),
                    "--task_policy", "traversal", "--prompt_policy", "traversal",
-                   "--prompt_file", "selected_prompt_downstream_task.json",
+                   "--prompt_file", str(prompt_path),
                    "--few_shot_prompt_fashion", "traversal", "--transform_in_collator", "--no_eval_train",
                    "--comparison_protocol_dir", str(protocol_dir),
                    "--output_result_to_file", str(output / (dataset + ".csv"))]
+        if s.get("sampling_policy"):
+            command += ["--comparison_sampling_policy", s["sampling_policy"]]
         if args.variant == "gimlet_adapter":
             command += ["--adapter_dim", str(args.adapter_dim)]
         elif args.variant == "gift":

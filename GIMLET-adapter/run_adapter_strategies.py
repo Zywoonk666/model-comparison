@@ -28,7 +28,9 @@ WORKSPACE = REPO.parent
 # Import protocol helpers without shadowing this repository's `model` package.
 sys.path.append(str(WORKSPACE / "GIFT"))
 from comparison_protocol import load_task
-from run_gimlet_baseline import DATASETS, prepare
+from run_gimlet_baseline import DATASETS as BASE_DATASETS, prepare
+
+DATASETS = BASE_DATASETS + ["muv", "cyp450", "toxcast"]
 
 
 def now():
@@ -74,29 +76,36 @@ def make_config(args, model_config=None, revision=None):
     if model_config is None:
         model_config, revision = cached_config()
     per_process = (args.memory_budget_gib - 2.) / args.parallel
+    strategies = list(STRATEGIES)
+    if getattr(args, "include_legacy_post", False):
+        strategies.insert(0, "shared_post")
+    prompt_file = Path(getattr(args, "prompt_file", None) or REPO / "prompts/selected_prompt_downstream_task.json").resolve()
     plans = {}
-    for strategy in STRATEGIES:
+    for strategy in strategies:
+        actual_strategy = "shared" if strategy == "shared_post" else strategy
+        placement = "post" if strategy == "shared_post" else "pre"
         launch_args = SimpleNamespace(repo=REPO, variant="gimlet_adapter", protocol_dir=args.protocol_dir,
             output_dir=args.output_root / strategy, datasets=args.datasets, few_shot=128, runseed=6,
             model_name_or_path="haitengzhao/gimlet", tokenizer_name="t5-small", data_root=args.data_root,
-            adapter_dim=args.adapter_dim)
+            adapter_dim=args.adapter_dim, prompt_file=prompt_file)
         _, selected = prepare(launch_args)
-        spec = adapter_spec(model_config["d_model"], args.adapter_dim, strategy, model_config["num_layers"])
+        spec = adapter_spec(model_config["d_model"], args.adapter_dim, actual_strategy, model_config["num_layers"])
         if spec["adapter_budget_gap_fraction"] > .01:
             raise ValueError("This reference width cannot match separate adapters within 1%; increase adapter_dim")
         head_count = model_config["vocab_size"] * model_config["d_model"]
-        spec.update(adapter_placement="pre", head_parameters=head_count,
+        spec.update(adapter_placement=placement, head_parameters=head_count,
                     trainable_parameters=spec["adapter_parameters"] + head_count,
                     head_policy="tied_head_and_input_embeddings")
         for plan in selected:
             plan.update(strategy=strategy, adapter=spec, job_id=strategy + "/" + plan["dataset"])
-            plan["command"] += ["--adapter_strategy", strategy, "--adapter_placement", "pre",
+            plan["command"] += ["--adapter_strategy", actual_strategy, "--adapter_placement", placement,
                                 "--cuda_memory_limit_gib", str(per_process), "--disable_tqdm"]
             plans[(strategy, plan["dataset"])] = plan
-    jobs = [plans[(strategy, dataset)] for dataset in args.datasets for strategy in STRATEGIES]
+    jobs = [plans[(strategy, dataset)] for dataset in args.datasets for strategy in strategies]
     return dict(created_at=now(), repo=str(REPO), output_root=str(args.output_root.resolve()),
                 protocol_dir=str(args.protocol_dir.resolve()), data_root=str(args.data_root.resolve()),
-                python=sys.executable, device=args.device, datasets=args.datasets, strategies=list(STRATEGIES),
+                python=sys.executable, device=args.device, datasets=args.datasets, strategies=strategies,
+                prompt_file=str(prompt_file),
                 model_revision=revision, jobs=jobs, parallel=args.parallel,
                 memory_budget_gib=args.memory_budget_gib, per_process_allocator_gib=per_process,
                 context_margin_gib=2., threads_per_process=max(1, len(os.sched_getaffinity(0)) // args.parallel))
@@ -146,6 +155,7 @@ def checked_rows(root, job, protocol_dir):
 
 
 def summarize(root, config, status):
+    strategies = config["strategies"]
     aggregates, details, comparisons = {}, [], []
     for job in config["jobs"]:
         if status["jobs"][job["job_id"]]["state"] != "completed":
@@ -163,19 +173,19 @@ def summarize(root, config, status):
     for dataset in config["datasets"]:
         metric = "residual_std_ddof1" if dataset in ("esol", "freesolv") else "roc_auc"
         row = dict(dataset=dataset, metric=metric)
-        row.update({s: aggregates.get((s, dataset), "") for s in STRATEGIES})
+        row.update({s: aggregates.get((s, dataset), "") for s in strategies})
         comparisons.append(row)
-    write_csv(root / "summary.csv", comparisons, ["dataset", "metric"] + list(STRATEGIES))
+    write_csv(root / "summary.csv", comparisons, ["dataset", "metric"] + strategies)
     write_csv(root / "results_long.csv", details, ["strategy", "dataset", "task", "prompt_id", "metric", "test_best",
               "valid_best", "best_epoch", "adapter_parameters", "trainable_parameters", "protocol_sha256"])
     lines = ["# Adapter 适配策略实验", "", "状态：{}；更新：{}。".format(status["state"], now()),
-        "全部使用 pre-block 插入位置；同一参数预算上限；分离组误差低于 1%。",
-        "四组均训练 Adapter 和共享 lm_head/input embedding；runseed=6，统一原始切分与训练设置。",
+        "shared_post 为层后共享 Adapter，其余组使用 pre-block；分离组参数误差低于 1%。",
+        "各组均训练 Adapter 和共享 lm_head/input embedding；runseed=6，同一数据集内共享切分与训练设置。",
         "分类为 ROC-AUC ↑；回归沿用残差标准差 ddof=1 ↓，不是 RMSE。Tox21 跑齐 12 个任务后等权平均。", "",
-        "| 数据集 | shared | graph | text | separate |", "|---|---:|---:|---:|---:|"]
+        "| 数据集 | " + " | ".join(strategies) + " |", "|---|" + "---:|" * len(strategies)]
     for row in comparisons:
         lines.append("| {} | {} |".format(row["dataset"], " | ".join(
-            "待完成" if row[s] == "" else "{:.6f}".format(row[s]) for s in STRATEGIES)))
+            "待完成" if row[s] == "" else "{:.6f}".format(row[s]) for s in strategies)))
     if status.get("error"):
         lines += ["", "队列停止原因：" + status["error"]]
     lines += ["", "实时进程与完成情况见 status.json；每组每数据集的日志和原始 CSV 位于对应子目录。",
@@ -295,12 +305,14 @@ def start(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         idle_gpu(args.device, args.memory_budget_gib)
         hashes = source_hashes()
+        prompt_path = Path(config["prompt_file"])
+        hashes[str(prompt_path.relative_to(WORKSPACE))] = digest(prompt_path)
         if args.resume:
             old = json.loads((root / "run_config.json").read_text())
             status = json.loads((root / "status.json").read_text())
             if status["state"] not in ("failed", "stopped", "completed"):
                 raise ValueError("Resume requires a stopped queue")
-            for field in ("jobs", "model_revision", "parallel", "memory_budget_gib", "device", "protocol_dir", "data_root"):
+            for field in ("jobs", "model_revision", "parallel", "memory_budget_gib", "device", "protocol_dir", "data_root", "strategies", "prompt_file"):
                 if config[field] != old[field]:
                     raise ValueError("Resume configuration differs: " + field)
             if hashes != old["source_sha256"]:
@@ -338,7 +350,7 @@ def start(args):
             if root.exists():
                 raise ValueError("Choose a fresh output directory, or explicitly use --resume")
             root.mkdir(parents=True)
-            for strategy in STRATEGIES:
+            for strategy in config["strategies"]:
                 (root / strategy).mkdir()
             config.update(source_sha256=hashes, commit=subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=WORKSPACE, text=True).strip())
@@ -346,7 +358,7 @@ def start(args):
             write_text(root / "environment.freeze.txt", subprocess.check_output(
                 [sys.executable, "-m", "pip", "freeze"], text=True))
             shutil.copy2(__file__, root / "run_adapter_strategies.snapshot.py")
-            budgets = [next(j["adapter"] for j in config["jobs"] if j["strategy"] == s) for s in STRATEGIES]
+            budgets = [dict(next(j["adapter"] for j in config["jobs"] if j["strategy"] == s), group=s) for s in config["strategies"]]
             write_csv(root / "parameter_budget.csv", budgets, list(budgets[0]))
             status = dict(started_at=now(), jobs={j["job_id"]: dict(state="pending") for j in config["jobs"]})
         status.update(state="running", launcher_pid=os.getpid())
@@ -361,7 +373,9 @@ def main():
     parser.add_argument("--output_root", type=Path, required=True)
     parser.add_argument("--protocol_dir", type=Path, default=WORKSPACE / "GIFT/cache/graph2token_protocol_4090")
     parser.add_argument("--data_root", type=Path, default=WORKSPACE / "cache/property_data")
-    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=DATASETS)
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=BASE_DATASETS)
+    parser.add_argument("--prompt_file", type=Path)
+    parser.add_argument("--include_legacy_post", action="store_true", help="Also run the original shared/post configuration")
     parser.add_argument("--adapter_dim", type=int, default=64)
     parser.add_argument("--parallel", type=int, default=4)
     parser.add_argument("--memory_budget_gib", type=float, default=40.)

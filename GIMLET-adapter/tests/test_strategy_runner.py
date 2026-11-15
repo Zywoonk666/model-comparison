@@ -9,7 +9,7 @@ import run_adapter_strategies as runner
 from comparison_protocol import export_task, load_task
 
 
-def fixture_config(tmp_path, dataset='bace'):
+def fixture_config(tmp_path, dataset='bace', **overrides):
     settings = dict(few_shot=128, runseed=6, seed=42, split='scaffold', fractions=[.8, .1, .1],
                     batch_size=128, grad_accum_step=8, epochs=60, test_interval=20, eval_epochs=[19, 39, 59],
                     lr=.01, weight_decay=0., optimizer='Adam', regression_metric='residual_std_ddof1')
@@ -20,6 +20,7 @@ def fixture_config(tmp_path, dataset='bace'):
     args = SimpleNamespace(output_root=tmp_path / 'out', protocol_dir=tmp_path / 'protocol',
                            data_root=tmp_path / 'data', parallel=4, memory_budget_gib=40.,
                            adapter_dim=64, datasets=[dataset], device='0')
+    vars(args).update(overrides)
     return runner.make_config(args, dict(d_model=512, num_layers=6, vocab_size=32100), 'test-revision')
 
 
@@ -51,6 +52,23 @@ def test_same_training_conditions_and_budget_with_four_parallel_jobs(tmp_path):
             assert command[command.index('--'+key)+1] == value
         counts[job['strategy']] = job['adapter']['adapter_parameters']
     assert counts == dict(shared=402816, graph=402816, text=402816, separate=399732)
+
+
+def test_fifth_group_preserves_original_shared_post(tmp_path):
+    config = fixture_config(tmp_path, include_legacy_post=True)
+    assert config['strategies'] == ['shared_post', 'shared', 'graph', 'text', 'separate']
+    root = Path(config['output_root'])
+    status = dict(state='completed', jobs={j['job_id']: dict(state='completed') for j in config['jobs']})
+    for job in config['jobs']:
+        assert job['manifests'] == config['jobs'][0]['manifests']
+        if job['strategy'] == 'shared_post':
+            assert job['adapter']['adapter_strategy'] == 'shared'
+            assert job['adapter']['adapter_placement'] == 'post'
+            assert job['command'][job['command'].index('--adapter_placement') + 1] == 'post'
+        write_results(root, job, config['protocol_dir'])
+    runner.summarize(root, config, status)
+    row = next(csv.DictReader((root / 'summary.csv').open()))
+    assert float(row['shared_post']) == .5
 
 
 def test_report_only_complete_tox21_and_reject_wrong_strategy(tmp_path):

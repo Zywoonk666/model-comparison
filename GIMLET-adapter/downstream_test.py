@@ -97,6 +97,8 @@ parser.add_argument('--adapter_dim', type=int, default=64,
                     help='Bottleneck width for few_shot_fashion=adapter')
 parser.add_argument('--adapter_strategy', choices=STRATEGIES, default='shared',
                     help='Direct residual update of graph, text, shared, or separate token adapters')
+parser.add_argument('--comparison_sampling_policy', choices=['legacy', 'independent_labeled'], default='legacy',
+                    help='Must match the frozen shared manifest; legacy behavior is unchanged')
 parser.add_argument('--adapter_placement', choices=['pre', 'post'], default='post',
                     help='Strategy study uses pre for all groups; post preserves legacy shared checkpoints')
 parser.add_argument('--cuda_memory_limit_gib', type=float, default=None,
@@ -187,6 +189,10 @@ def better_result(result,reference,dataset):
         return result<reference
 
 def train(model, loader, optimizer):
+    if args.comparison_sampling_policy == 'independent_labeled':
+        from training_epoch import train_labeled_epoch
+        return train_labeled_epoch(model, loader, optimizer, args.grad_accum_step,
+                                   progress=lambda values: tqdm(values, disable=args.disable_tqdm))
     model.train()
     total_loss = 0
 
@@ -331,7 +337,8 @@ def downstream_task_by_transform(model,train_loader,val_loader,test_loader,promp
                         np.savez(filename, val_target=val_target, val_pred=val_pred,
                                  test_target=test_target, test_pred=test_pred)
         if args.comparison_protocol_dir:
-            best_val_idx = comparison_protocol.select_validation_result(val_roc_list, task_type(args.dataset))
+            best_val_idx = comparison_protocol.select_validation_result(val_roc_list, task_type(args.dataset),
+                allow_zero_auc=(comparison_manifest['protocol'] == 'independent_labeled_v1'))
         elif max(val_roc_list) > 0:
             best_val_idx=val_roc_list.index(max(val_roc_list)) if task_type(args.dataset)=='cla' else val_roc_list.index(min(val_roc_list))
         else:
