@@ -1,3 +1,6 @@
+from offline_runtime import configure_offline_runtime
+configure_offline_runtime()
+
 from os.path import join
 import numpy as np
 import pandas as pd
@@ -16,6 +19,7 @@ import commentjson
 from basic_pipeline import load_graph_args,eval_result
 from model import get_model
 from model.GIMLET.adapter import configure_adapter_training
+from adapter_budget import STRATEGIES, adapter_spec
 from dataloaders import add_prompt_transform_dict,\
     graph_text_collator_dict, \
     MoleculeDatasetSplitLabel,graph_text_tokenizer_dict
@@ -91,6 +95,12 @@ parser.add_argument('--few_shot_fashion',type=str,default='finetune',choices=['f
 parser.add_argument('--few_shot_prompt_fashion',type=str,default='traversal',choices=['traversal', 'max','max_abs'])
 parser.add_argument('--adapter_dim', type=int, default=64,
                     help='Bottleneck width for few_shot_fashion=adapter')
+parser.add_argument('--adapter_strategy', choices=STRATEGIES, default='shared',
+                    help='Direct residual update of graph, text, shared, or separate token adapters')
+parser.add_argument('--adapter_placement', choices=['pre', 'post'], default='post',
+                    help='Strategy study uses pre for all groups; post preserves legacy shared checkpoints')
+parser.add_argument('--cuda_memory_limit_gib', type=float, default=None,
+                    help='Optional per-process PyTorch allocator limit, in GiB')
 
 #about saving strategies
 parser.add_argument('--output_model_dir', type=str, default='')
@@ -203,6 +213,9 @@ def downstream_task_by_transform(model,train_loader,val_loader,test_loader,promp
         model = get_model(args, graph_args,tokenizer)
     
     model.to(device)
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    adapter_metadata = {}
     if args.few_shot_fashion == 'finetune':
         model_param_group = [{'params': model.parameters()}]
     elif args.few_shot_fashion == 'adapter':
@@ -210,6 +223,15 @@ def downstream_task_by_transform(model,train_loader,val_loader,test_loader,promp
         model_param_group = [{'params': trainable_params}]
         adapter_count = sum(param.numel() for param in model.encoder.adapters.parameters())
         trainable_count = sum(param.numel() for param in trainable_params)
+        adapter_metadata = adapter_spec(model.config.d_model, args.adapter_dim,
+                                        args.adapter_strategy, len(model.encoder.adapters))
+        if adapter_count != adapter_metadata['adapter_parameters']:
+            raise ValueError('Actual adapter parameter count differs from budget accounting')
+        adapter_metadata.update(trainable_parameters=trainable_count,
+                                head_parameters=sum(p.numel() for p in model.lm_head.parameters()),
+                                head_policy='tied_head_and_input_embeddings',
+                                adapter_placement=args.adapter_placement)
+        print('Adapter strategy/budget:', adapter_metadata, flush=True)
         print('Adapter tuning: bottleneck={}, adapter parameters={}, total trainable={}'.format(
             args.adapter_dim, adapter_count, trainable_count))
         print('Training adapters and lm_head; tied input embeddings share the head updates.')
@@ -327,6 +349,12 @@ def downstream_task_by_transform(model,train_loader,val_loader,test_loader,promp
                               columns=['dataset','split', 'model_name_or_path','epoch','lr','runseed','best_val_idx','train_best','valid_best','test_best','prompt'
                                        ])
 
+            for key, value in adapter_metadata.items():
+                df[key] = value
+            if device.type == 'cuda':
+                df['gpu_peak_allocated_mib'] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                df['gpu_peak_reserved_mib'] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+
             if args.comparison_protocol_dir:
                 for key, value in comparison_protocol.result_metadata(comparison_manifest, best_val_idx, prompt).items():
                     df[key] = value
@@ -351,6 +379,14 @@ if __name__ == '__main__':
     np.random.seed(args.runseed)
     device = torch.device('cuda:' + str(args.device)) \
         if (torch.cuda.is_available() and not args.no_cuda) else torch.device('cpu')
+    if args.cuda_memory_limit_gib is not None:
+        if device.type != 'cuda':
+            raise ValueError('A CUDA memory budget requires an available CUDA GPU')
+        total_bytes = torch.cuda.get_device_properties(device).total_memory
+        fraction = args.cuda_memory_limit_gib * (1024 ** 3) / total_bytes
+        if not 0 < fraction <= 1:
+            raise ValueError('cuda_memory_limit_gib must fit within the physical GPU memory')
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
     if torch.cuda.is_available() and not args.no_cuda :
         torch.cuda.manual_seed_all(args.runseed)
 

@@ -8,7 +8,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
 )
 from model.graphormer.modules.graphormer_graph_encoder import GraphEncoder
-from .adapter import BottleneckAdapter
+from .adapter import build_adapter
 
 logger = logging.get_logger(__name__)
 
@@ -54,8 +54,13 @@ class GIMLETEncoderStack(T5Stack):
         adapter_dim = getattr(config, "adapter_dim", 0)
         if adapter_dim < 0:
             raise ValueError("adapter_dim must be non-negative")
+        self.adapter_placement = getattr(config, "adapter_placement", "post")
+        if self.adapter_placement not in ("pre", "post"):
+            raise ValueError("adapter_placement must be pre or post")
+        if adapter_dim and self.adapter_placement == "post" and getattr(config, "adapter_strategy", "shared") != "shared":
+            raise ValueError("Use pre placement for modality strategies: final graph outputs are discarded")
         self.adapters = nn.ModuleList([
-            BottleneckAdapter(config.d_model, adapter_dim)
+            build_adapter(config.d_model, adapter_dim, getattr(config, "adapter_strategy", "shared"))
             for _ in self.block
         ]) if adapter_dim else nn.ModuleList()
 
@@ -212,6 +217,14 @@ class GIMLETEncoderStack(T5Stack):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
+            hidden_states_graph_mapped = hidden_state_graph.transpose(0, 1)
+            hidden_states_merged = torch.cat([hidden_states_graph_mapped, hidden_states], 1)
+            if self.adapters and self.adapter_placement == "pre":
+                hidden_states_merged = self.adapters[i](
+                    hidden_states_merged, graph_length=hidden_states_graph_mapped.shape[1])
+            attention_mask_merged = torch.cat(
+                [attention_mask_graph.unsqueeze(1).unsqueeze(1), extended_attention_mask], 3)
+
             if self.gradient_checkpointing and self.training:
                 if use_cache:
                     logger.warning(
@@ -221,15 +234,15 @@ class GIMLETEncoderStack(T5Stack):
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        return tuple(module(*inputs, use_cache, output_attentions))
+                        return tuple(module(*inputs, use_cache=use_cache, output_attentions=output_attentions))
 
                     return custom_forward
 
                 layer_outputs = checkpoint(
                     create_custom_forward(layer_module),
-                    hidden_states,
-                    extended_attention_mask,
-                    position_bias_merged,
+                    hidden_states_merged,
+                    None,
+                    position_bias_merged + attention_mask_merged,
                     encoder_hidden_states,
                     encoder_extended_attention_mask,
                     encoder_decoder_position_bias,
@@ -238,18 +251,6 @@ class GIMLETEncoderStack(T5Stack):
                     None,  # past_key_value is always None with gradient checkpointing
                 )
             else:
-                # transpose [length,batch,dim] to [batch,length,dim]
-                # if not self.graph_encoder.args.unimodel:
-                #     hidden_states_graph_mapped = (self.graph_projector(hidden_state_graph)).transpose(0, 1)
-                # else:
-                hidden_states_graph_mapped = hidden_state_graph.transpose(0, 1)
-
-                hidden_states_merged = torch.cat([hidden_states_graph_mapped, hidden_states], 1)
-                attention_mask_merged = torch.cat(
-                    [attention_mask_graph.unsqueeze(1).unsqueeze(1), extended_attention_mask], 3)
-
-
-
                 layer_outputs = layer_module(
                     hidden_states_merged,
                     # attention_mask=attention_mask_merged,
@@ -271,10 +272,11 @@ class GIMLETEncoderStack(T5Stack):
 
             hidden_states_merged, present_key_value_state = layer_outputs[:2]
 
-            # One adapter per layer, shared by graph and text tokens. Apply it
-            # after the complete T5 block (attention + FFN), before splitting.
-            if self.adapters:
-                hidden_states_merged = self.adapters[i](hidden_states_merged)
+            # Route the residual using the actual graph/text boundary.
+            # Graph tokens include the virtual graph token and graph padding.
+            if self.adapters and self.adapter_placement == "post":
+                hidden_states_merged = self.adapters[i](
+                    hidden_states_merged, graph_length=hidden_states_graph_mapped.shape[1])
 
             hidden_states = hidden_states_merged[:, hidden_states_graph_mapped.shape[1]:, :]
             # transpose again for consistance

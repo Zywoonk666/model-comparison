@@ -8,6 +8,7 @@ from .MoMu.MoMu_Model import get_MoMu_model
 from .llm import LLM
 from transformers import OPTForCausalLM
 import torch.optim as optim
+from adapter_budget import STRATEGIES
 from model.GIMLET.gnn_model import GNN, GNN_graphpred
 
 GraphTransformer_dict={'gimlet':GraphT5TransformerForConditionalGeneration,'gint5':GraphT5TransformerForConditionalGeneration,'kvplm':prepare_kvplm_model,'momu':get_MoMu_model, 'galactica':OPTForCausalLM}
@@ -22,11 +23,15 @@ from transformers import (
 def get_model(args,graph_args,tokenizer):
     adapter_tuning = getattr(args, 'few_shot_fashion', None) == 'adapter'
     adapter_dim = getattr(args, 'adapter_dim', 64)
+    adapter_strategy = getattr(args, 'adapter_strategy', 'shared')
+    adapter_placement = getattr(args, 'adapter_placement', 'post')
     if adapter_tuning:
         if args.transformer_backbone != 'gimlet':
             raise ValueError('Adapter tuning is supported only for gimlet')
         if adapter_dim <= 0:
             raise ValueError('adapter_dim must be positive for adapter tuning')
+        if adapter_strategy not in STRATEGIES:
+            raise ValueError('Invalid adapter_strategy')
 
     if not (args.transformer_backbone in ['kvplm','momu','galactica','gpt3']):
 
@@ -35,6 +40,8 @@ def get_model(args,graph_args,tokenizer):
             if adapter_tuning:
                 config = AutoConfig.from_pretrained(args.model_name_or_path)
                 config.adapter_dim = adapter_dim
+                config.adapter_strategy = adapter_strategy
+                config.adapter_placement = adapter_placement
                 model_kwargs['config'] = config
             model = GraphTransformer_dict[args.transformer_backbone].from_pretrained(
                 args.model_name_or_path,
@@ -53,6 +60,8 @@ def get_model(args,graph_args,tokenizer):
             config.graph_args = vars(graph_args)  #use the user-provided graph args
             if adapter_tuning:
                 config.adapter_dim = adapter_dim
+                config.adapter_strategy = adapter_strategy
+                config.adapter_placement = adapter_placement
 
             model = GraphTransformer_dict[args.transformer_backbone].from_pretrained(
                 args.model_name_or_path,

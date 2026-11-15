@@ -5,6 +5,9 @@ from pathlib import Path
 
 import torch
 from torch import nn
+import pytest
+
+from adapter_budget import adapter_spec, bottleneck_parameters
 
 
 # Avoid model/__init__.py, which eagerly imports all optional baseline models.
@@ -15,6 +18,7 @@ adapter_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter_module)
 BottleneckAdapter = adapter_module.BottleneckAdapter
 configure_adapter_training = adapter_module.configure_adapter_training
+build_adapter = adapter_module.build_adapter
 
 
 def test_initial_adapter_preserves_features_and_input_gradient():
@@ -86,3 +90,42 @@ def test_few_shot_updates_learn_from_zero_up_and_freeze_backbone():
         if name in frozen_before:
             assert p.grad is None
             assert torch.equal(p, frozen_before[name])
+
+
+@pytest.mark.parametrize('strategy', ['shared', 'graph', 'text', 'separate'])
+def test_budget_and_direct_token_routing(strategy):
+    module = build_adapter(512, 64, strategy)
+    spec = adapter_spec(512, 64, strategy)
+    assert sum(p.numel() for p in module.parameters()) == spec['adapter_parameters']
+    assert spec['adapter_parameters'] <= bottleneck_parameters(512, 64)
+    assert spec['adapter_budget_gap_fraction'] < .01
+    hidden = torch.randn(2, 9, 512, requires_grad=True)
+    assert torch.equal(module(hidden, graph_length=4), hidden)
+    # Force a nonzero residual to test routing, not merely zero initialization.
+    for child in module.modules():
+        if isinstance(child, BottleneckAdapter):
+            nn.init.constant_(child.up.bias, .25)
+    out = module(hidden, graph_length=4)
+    if strategy != 'text':
+        assert torch.allclose(out[:, :4], hidden[:, :4] + .25)
+    else:
+        assert torch.equal(out[:, :4], hidden[:, :4])
+    if strategy != 'graph':
+        assert torch.allclose(out[:, 4:], hidden[:, 4:] + .25)
+    else:
+        assert torch.equal(out[:, 4:], hidden[:, 4:])
+    out.sum().backward()
+    assert torch.isfinite(hidden.grad).all()
+    if strategy == 'separate':
+        assert not ({id(p) for p in module.graph.parameters()} & {id(p) for p in module.text.parameters()})
+        assert (spec['adapter_graph_dim'], spec['adapter_text_dim']) == (31, 31)
+
+
+@pytest.mark.parametrize('boundary', [0, 9])
+@pytest.mark.parametrize('strategy', ['graph', 'text', 'separate'])
+def test_empty_token_slice_is_valid(strategy, boundary):
+    module = build_adapter(16, 8, strategy)
+    hidden = torch.randn(2, 9, 16)
+    assert torch.equal(module(hidden, graph_length=boundary), hidden)
+    with pytest.raises(ValueError, match='boundary'):
+        module(hidden, graph_length=10)

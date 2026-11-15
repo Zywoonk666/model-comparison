@@ -93,3 +93,119 @@ It uses synthetic inputs and a tiny local checkpoint. Only unused baseline
 imports (GIN, KVPLM, MoMu, LLM) are replaced in the test; the GIMLET graph
 embedding, T5 encoder/decoder, Adapter, and model-loading code are exercised.
 This does not run a full MoleculeNet experiment.
+
+## Four token adaptation strategies (4090 study)
+
+The new study compares **shared**, **graph-only**, **text-only**, and **separate**
+residual adapters, keeping the pretrained backbone, tied output/input embedding
+training policy, data, prompts, optimizer, and effective batch size fixed.
+
+| Strategy | Graph bottleneck | Text bottleneck | Adapter parameters (6 layers) | Total trainable |
+|---|---:|---:|---:|---:|
+| `shared` | 64, shared | 64, shared | 402,816 | 16,838,016 |
+| `graph` | 64 | none | 402,816 | 16,838,016 |
+| `text` | none | 64 | 402,816 | 16,838,016 |
+| `separate` | 31 | 31, independent | 399,732 | 16,834,932 |
+
+For hidden width d and bottleneck r, a bottleneck has `(2d+1)r+3d` parameters,
+including LayerNorm and biases. Separate adapters have independent normalization,
+down/up projections, and biases. Two width-32 adapters exceed the width-64 shared
+budget. The runner therefore chooses the largest balanced integer widths under
+the same budget ceiling: 31+31, **0.77% below** the shared count. This is a matched
+ceiling within 1%, not mathematically identical counts or padding with unused
+parameters. Both adapter-only and total trainable counts are recorded.
+
+All four NEW groups use `--adapter_placement pre`: each adapter acts immediately
+before its joint encoder block. This is necessary because GIMLET returns only
+text states to the decoder: a graph-only adapter AFTER the final block has no
+effect on prediction. Tests and real-checkpoint GPU validation check that the
+last graph branch receives gradients. A graph token includes the virtual graph
+token; the boundary uses the padded graph length, and existing attention masks
+continue to ignore padded keys. Routing controls the direct residual update;
+later attention may carry its effect to the other modality.
+
+The default `shared/post` behavior remains compatible with existing checkpoints
+and commands. The four-way runner explicitly uses `pre` for EVERY group and
+re-trains shared. **Do not treat the old shared/post results as the new control.**
+Non-shared/post configurations are rejected to prevent counting ineffective
+last-layer graph parameters. No OT, progressive mask, or graph experts are added.
+
+### Background execution, independent of VS Code / SSH
+
+From `/root/model-comparison`:
+
+```bash
+# CPU-only validation: no training or CUDA allocation.
+bash GIMLET-adapter/launch_strategies_4090.sh --dry_run
+
+# nohup + setsid + detached stdin; four independent jobs, up to 40 GiB total budget.
+bash GIMLET-adapter/launch_strategies_4090.sh \
+  --output_root cache/adapter_strategies/my_new_run \
+  --parallel 4 --memory_budget_gib 40
+```
+
+The launcher returns immediately and prints the PID, root, and external launcher
+log path. GPU compute processes already running cause the supervisor to refuse
+startup. Closing the terminal or disconnecting VS Code does not stop the queue;
+server reboot/shutdown still stops processes. A GPU lock prevents duplicate
+queues. A nonzero worker exit stops this queue and preserves its logs/results.
+Offline runs also disable OGB 1.3.x's optional online version-check thread, which
+otherwise may keep a finished process alive while waiting for an HTTP response.
+The installed OGB version and all graph/data/model implementations are retained.
+
+Parallelism uses the existing micro batch 16, gradient accumulation 8, effective
+batch 128, and FP32; it does not silently change optimization or precision.
+The 40 GiB budget reserves 2 GiB for CUDA contexts and non-allocator overhead,
+then gives each of four workers a PyTorch allocator cap of 9.5 GiB. This is an
+allocator/resource budget, not a promise to occupy all memory or a hardware-level
+cap on non-PyTorch allocations. CPU threads are divided among workers (2 each
+on the current 8-core machine). The runner reports actual peak allocator memory.
+
+Six datasets only: BACE, HIV, BBBP, Tox21, ESOL, FreeSolv. Four jobs may run in
+parallel; the pending list is dataset-first. All use the 17 existing manifests
+at `GIFT/cache/graph2token_protocol_4090`, runseed 6, seed 42, 60 epochs, Adam
+lr .01, and validation-selected evaluation at epochs 19/39/59. This is the legacy
+sampling protocol: `few_shot=128` is not a uniform total of 128 labeled molecules.
+Regression retains residual standard deviation (ddof=1), not RMSE. These choices
+isolate strategy changes; this run does not establish a new strict few-shot or
+publication-standard regression protocol.
+
+### Outputs and recovery
+
+`cache/latest_adapter_strategy_run.txt` points to the latest formal root:
+
+```bash
+strategy_root="$(cat cache/latest_adapter_strategy_run.txt)"
+cat "$strategy_root/status.json"
+cat "$strategy_root/RESULTS.md"
+tail -n 30 "$strategy_root/graph/bace.log"
+watch -n 2 nvidia-smi
+```
+
+- `RESULTS.md`, `summary.csv`: automatically updated after each complete dataset
+  job. Tox21 is averaged only after all 12 properties finish; missing cells stay blank.
+- `results_long.csv`: individual task scores and validation-selected epochs.
+- `parameter_budget.csv`: exact parameter counts, widths, head policy, budget gap.
+- `{shared,graph,text,separate}/{dataset}.{csv,log}`: raw results and training logs.
+- `status.json`, `pid`, `exit_code`, `finished_at`: lifecycle, worker PIDs, errors.
+- `run_config.json`: exact commands, manifest hashes, frozen source hashes, Git commit.
+- `environment.freeze.txt`, supervisor snapshot: reproducibility information.
+
+No checkpoints are saved by default, matching the previous benchmark. Resume a
+stopped queue with the SAME arguments and `--resume`. Complete validated dataset
+jobs are retained. Incomplete CSV/log files are archived under `recovery/`, and
+that dataset's complete traversal starts over with its original seed. The queue
+will not silently skip individual Tox21 tasks or mix partial runs. A changed
+runtime source requires a fresh experiment directory.
+
+```bash
+bash GIMLET-adapter/launch_strategies_4090.sh \
+  --output_root "$strategy_root" --parallel 4 --memory_budget_gib 40 --resume
+```
+
+Model tests cover zero-initialized identity, graph/text routing, parameter counts,
+independent separate branches, gradients including the last graph branch,
+checkpoint loading, and gradient checkpointing. Runner tests check shared
+protocols, incomplete Tox21 handling, metadata rejection, and child scheduling.
+`verify_strategy_gpu.py --output PATH` additionally exercises four real cached
+GIMLET checkpoints on a batch of 16 actual BACE training molecules with CUDA.

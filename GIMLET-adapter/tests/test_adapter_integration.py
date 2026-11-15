@@ -41,9 +41,12 @@ def gimlet(monkeypatch):
                 sys.modules.pop(name, None)
 
 
-def test_pretrained_identity_training_and_checkpoint_reload(gimlet, tmp_path, monkeypatch):
+@pytest.mark.parametrize('strategy,placement,checkpointing', [
+    ('shared','post',False),('shared','pre',False),('graph','pre',False),('text','pre',False),
+    ('separate','pre',False),('graph','pre',True),('separate','pre',True)])
+def test_pretrained_identity_training_and_checkpoint_reload(gimlet, tmp_path, monkeypatch, strategy, placement, checkpointing):
     from transformers import BatchEncoding, T5Config
-    from model.GIMLET.adapter import configure_adapter_training
+    from model.GIMLET.adapter import configure_adapter_training, BottleneckAdapter
 
     torch.manual_seed(17)
     graph_args = gimlet.GIMLETConfig()
@@ -62,6 +65,7 @@ def test_pretrained_identity_training_and_checkpoint_reload(gimlet, tmp_path, mo
     args = SimpleNamespace(
         transformer_backbone="gimlet", model_name_or_path="haitengzhao/gimlet",
         tokenizer_name=str(base_path), few_shot_fashion="adapter", adapter_dim=4,
+        adapter_strategy=strategy, adapter_placement=placement,
     )
     # Exercise the official-checkpoint branch without network access, using
     # real from_pretrained() loading of the tiny local checkpoint instead.
@@ -76,7 +80,8 @@ def test_pretrained_identity_training_and_checkpoint_reload(gimlet, tmp_path, mo
     assert adapted.config.adapter_dim == 4
     for name, tensor in baseline.state_dict().items():
         assert torch.equal(tensor, adapted.state_dict()[name]), name
-    for adapter in adapted.encoder.adapters:
+    bottlenecks = [m for m in adapted.encoder.adapters.modules() if isinstance(m, BottleneckAdapter)]
+    for adapter in bottlenecks:
         assert torch.count_nonzero(adapter.up.weight).item() == 0
         assert torch.count_nonzero(adapter.up.bias).item() == 0
 
@@ -115,16 +120,22 @@ def test_pretrained_identity_training_and_checkpoint_reload(gimlet, tmp_path, mo
             adapted.generate(**generation_batch, max_length=4),
         )
 
+    # Keep the tiny rank-1 separate branches' ReLUs active while checking
+    # connectivity. Random dead ReLUs are not evidence of a missing gradient path.
+    with torch.no_grad():
+        for adapter in bottlenecks:
+            adapter.down.bias.fill_(3.0)
     params = configure_adapter_training(adapted)
     frozen = {name: p.detach().clone() for name, p in adapted.named_parameters() if not p.requires_grad}
     optimizer = torch.optim.Adam(params, lr=1e-3)
     adapted.train()
+    adapted.encoder.gradient_checkpointing = checkpointing
     for step in range(2):
         optimizer.zero_grad()
         loss = adapted(**batch).loss
         assert torch.isfinite(loss)
         loss.backward()
-        for adapter in adapted.encoder.adapters:
+        for adapter in bottlenecks:
             assert adapter.up.weight.grad.abs().sum().item() > 0
             if step == 1:
                 assert adapter.down.weight.grad.abs().sum().item() > 0
@@ -141,6 +152,8 @@ def test_pretrained_identity_training_and_checkpoint_reload(gimlet, tmp_path, mo
     assert info["missing_keys"] == []
     assert info["unexpected_keys"] == []
     assert restored.config.adapter_dim == 4
+    assert restored.config.adapter_strategy == strategy
+    assert restored.config.adapter_placement == placement
     with torch.no_grad():
         assert torch.equal(adapted(**batch).logits, restored(**batch).logits)
 
