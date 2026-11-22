@@ -1,5 +1,42 @@
 # 统一实验入口
 
+## 本机 RTX 4090 环境
+
+三个模型共用 `env_gift`。4090 的配置保存在 `GIFT/environment.4090.yml`：
+Python 3.8.20、PyTorch 2.0.1 + CUDA 11.8、Transformers 4.28.1、PyG 1.7.2，
+以及对应 PyTorch/CUDA 的 PyG 扩展。原始 `GIFT/environment.yml` 保留。
+DGL 未包含在 4090 配置中；本次三个模型的执行路径不使用它。
+
+新机器先创建环境，并按 `GIFT/README.md` 缓存预训练权重及 tokenizer：
+
+```bash
+conda env create -f GIFT/environment.4090.yml
+conda activate env_gift
+```
+
+本机共享数据在 `cache/property_data/`，共享清单在
+`GIFT/cache/graph2token_protocol_4090/`，保留原环境的清单。新建清单的命令为：
+
+```bash
+python GIFT/export_graph2token_data.py \
+  --data_root /root/model-comparison/cache/property_data \
+  --output_dir /root/model-comparison/GIFT/cache/graph2token_protocol_4090 \
+  --few_shot 128 --runseed 6
+```
+
+准备完成后可直接运行，无需手动激活环境：
+
+```bash
+bash run_4090.sh --dry_run
+bash run_4090.sh
+```
+
+`run_4090.sh` 先验证 GPU 前向/反向计算，再调用原统一入口。
+它默认使用 `env_gift` 的 Python、GPU 0、上述共享数据和清单，以及离线权重。
+原入口的 `--model`、`--output_root` 等参数仍可使用；重复运行需要新的结果目录。
+
+## 通用用法
+
 两个实验分支的仓库根目录均提供 `runexperiment.sh`。先激活已安装 GIFT/GIMLET
 依赖的训练环境，再运行脚本。默认依次执行 GIFT、GIMLET-original、GIMLET-adapter，
 一个模型完成后才启动下一个；任一模型失败即停止。
@@ -77,6 +114,15 @@ bash runexperiment.sh --model gift --mask_start_ratio 1 --mask_end_ratio 0.2 \
 默认训练 mask 为 `1 -> 0`；验证/测试仍采用原有确定性分层 mask。
 `MASK_START_RATIO`、`MASK_END_RATIO` 环境变量同样可用。
 模型改动与验证范围见 [GIFT/README_MODEL_VARIANTS.md](GIFT/README_MODEL_VARIANTS.md)。
+
+## GIFT 三模块消融
+
+OT、渐进 mask、图专家的配对消融，以及固定 epoch mask 的诊断组，见
+[GIFT/README_ABLATIONS.md](GIFT/README_ABLATIONS.md)。入口为
+`bash run_gift_ablations_4090.sh`；复用 `graph2token_protocol_4090` 的六数据集切分，
+每组使用独立输出目录，完成后自动汇总 Tox21 的 12 个任务。
+`cache/latest_gift_ablation.txt` 指向最新正式消融输出；训练已启动时直接查看该目录中的
+`status.json` 和 `RESULTS.md`，不要重复启动队列。
 
 ## 推送两个分支
 

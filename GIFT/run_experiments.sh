@@ -4,9 +4,8 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
-if [ ! -d cache ]; then
-  mkdir cache
-fi
+output_dir="${OUTPUT_DIR:-cache}"
+mkdir -p "$output_dir"
 
 run_ablation() {
     local device=$1
@@ -20,7 +19,7 @@ run_ablation() {
     local proj_blocks=${9:-2}
     local proj_act=${10:-relu} 
     local few_shot_number=128 
-    local out_file_prefix="cache/"
+    local out_file_prefix="${output_dir}/"
     local outfile="${out_file_prefix}${exp_name}.csv"
     local dataset_list=(bace hiv bbbp tox21 esol freesolv)
     local comparison_args=()
@@ -43,7 +42,7 @@ run_ablation() {
             --model_name_or_path "haitengzhao/gimlet" \
             --tokenizer_name t5-small \
             --dataset "$dataset" \
-            --runseed 6 \
+            --runseed 5 \
             --batch_size 128 \
             --grad_accum_step 8 \
             --lr 1e-2 \
@@ -51,7 +50,7 @@ run_ablation() {
             --test_interval 20 \
             --transform_in_collator \
             --no_eval_train \
-            --output_result_to_file $outfile \
+            --output_result_to_file "$outfile" \
             "${comparison_args[@]}" \
             --not_retest_tasks_in_result_file
     done

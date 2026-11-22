@@ -60,7 +60,7 @@ def test_actual_downstream_manifest_branch_rebuilds_all_loaders(tmp_path, repo):
     args, smiles, labels, _ = make_manifest(tmp_path)
     tree = ast.parse((ROOT.parent / repo / "downstream_test.py").read_text())
     branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
-                  and ast.unparse(node.test) == "args.comparison_protocol_dir"
+                  and ast.dump(node.test) == ast.dump(ast.parse("args.comparison_protocol_dir", mode="eval").body)
                   and any(isinstance(n, ast.Name) and n.id == "comparison_indices" for n in ast.walk(node)))
 
     class Dataset:
